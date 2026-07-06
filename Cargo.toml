@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/types", "crates/position_keeper", "crates/ingester"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"

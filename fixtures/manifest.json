@@ -1,0 +1,41 @@
+{
+  "hl": {
+    "lines": 500,
+    "poison": [
+      {
+        "event_id": "hl-poison-unknown",
+        "reason": "UnknownSymbol"
+      },
+      {
+        "event_id": "hl-poison-offtick",
+        "reason": "OffTick"
+      },
+      {
+        "detected_at": "ingest",
+        "event_id": "hl-dup-byz"
+      }
+    ]
+  },
+  "matched": {
+    "expected_sum_realized_pnl_micro": 0,
+    "lines": 100,
+    "sum_fees_micro": 14950
+  },
+  "pm": {
+    "lines": 500,
+    "poison": [
+      {
+        "event_id": "pm-poison-unknown",
+        "reason": "UnknownSymbol"
+      },
+      {
+        "event_id": "pm-poison-range",
+        "reason": "PriceOutOfRange"
+      },
+      {
+        "detected_at": "ingest",
+        "event_id": "pm-dup-byz"
+      }
+    ]
+  }
+}
