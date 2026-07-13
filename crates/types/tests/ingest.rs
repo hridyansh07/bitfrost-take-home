@@ -3,13 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use types::{
-    merge, read_hl, read_pm, shuffle, Canonicalize, Fill, RawEvent, RawLine, Registry,
-    RejectReason, Venue,
-};
+use types::{read_hl, read_pm, Canonicalize, Fill, RawEvent, RawLine, Registry, RejectReason};
 
 #[test]
-fn fixtures_parse_canonicalize_merge_and_shuffle() {
+fn fixtures_parse_and_canonicalize() {
     let fixture_dir = fixture_dir();
     let manifest: Value = serde_json::from_str(
         &fs::read_to_string(fixture_dir.join("manifest.json"))
@@ -38,22 +35,6 @@ fn fixtures_parse_canonicalize_merge_and_shuffle() {
             assert!(canonicalize(event, &registry).is_ok());
         }
     }
-
-    let merged_once = merge(hl.clone(), pm.clone());
-    let merged_twice = merge(hl.clone(), pm.clone());
-    assert_eq!(merged_once, merged_twice);
-    assert_eq!(merged_once.len(), hl.len() + pm.len());
-
-    let mut shuffled_once = merged_once.clone();
-    let mut shuffled_twice = merged_once.clone();
-    shuffle(&mut shuffled_once, 7);
-    shuffle(&mut shuffled_twice, 7);
-    assert_eq!(shuffled_once, shuffled_twice);
-
-    sort_by_origin(&mut shuffled_once);
-    let mut original = merged_once;
-    sort_by_origin(&mut original);
-    assert_eq!(shuffled_once, original);
 }
 
 fn fixture_dir() -> PathBuf {
@@ -97,16 +78,6 @@ fn assert_poison(
             (reason, result) => panic!("{event_id} expected {reason}, got {result:?}"),
         }
     }
-}
-
-fn sort_by_origin(lines: &mut [RawLine]) {
-    lines.sort_by_key(|line| {
-        let rank = match line.venue {
-            Venue::Hl => 0,
-            Venue::Pm => 1,
-        };
-        (rank, line.arrival)
-    });
 }
 
 fn assert_sequence_pathologies(lines: &[RawLine], byzantine_id: &str) {

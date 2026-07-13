@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 types = { path = "../types" }
-position-keeper = { path = "../position_keeper" }
 
 [dev-dependencies]
+position-keeper = { path = "../position_keeper" }
 serde_json = "1"

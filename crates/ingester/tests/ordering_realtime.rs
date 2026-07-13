@@ -1,23 +1,29 @@
-/// cargo test -p ingester --test ordering_realtime  -- --nocapture 2>&1
-/// 
-/// Test current vs proposed algorithm by running the invariants on the current algorithm to devise the 
-/// proposed pattern of events uses the fixtures .ndjson files to run the test 
-/// Outputs /out/ordering_algo.json. and /out/ordering_current.json with the proposed order
-use std::collections::BTreeMap;
+//! cargo test -p ingester --test ordering_realtime  -- --nocapture 2>&1
+//!
+//! Realtime demonstration of the Algo.md pipeline: two threaded venue streams replay the
+//! fixture files, each event is stamped with its genuine receive time (the Instant it comes
+//! off the channel-as-socket), and `Ingester::fill_caught` pushes the survivors straight onto
+//! the sequencer lanes. The emitted tape is checked against the Algo.md invariants and written
+//! to ordering_algo.json — under `just realtime` that lands in the repo's out/ directory;
+//! plain `cargo test` writes to a temp directory so default test runs don't touch the repo.
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ingester::Ingester;
-use types::{read_hl, read_pm, Fill, RawEvent, RawLine, Registry, Venue};
+use ingester::{Ingester, Sequencer};
+use types::{read_hl, read_pm, RawLine, Registry, Venue};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
 }
 
 fn emit_json(name: &str, entries: Vec<serde_json::Value>) -> PathBuf {
-    let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../out");
+    let out_dir = std::env::var_os("BITFROST_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("bitfrost-out"));
     std::fs::create_dir_all(&out_dir).unwrap();
     let path = out_dir.join(name);
     let body = serde_json::to_string_pretty(&serde_json::Value::Array(entries)).unwrap();
@@ -25,49 +31,20 @@ fn emit_json(name: &str, entries: Vec<serde_json::Value>) -> PathBuf {
     path.canonicalize().unwrap()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SequencedFill {
-    global_seq: u64,
-    recv_ts: u64,
-    fill: Fill,
-}
-
-/// Stub of the Algo.md merger: SORT_KEY = (recv_ts, venue_priority, venue_seq).
-fn sequence_fills(mut stamped: Vec<(u64, Fill)>) -> Vec<SequencedFill> {
-    stamped.sort_by_key(|(recv_ts, fill)| (*recv_ts, fill.venue, fill.seq));
-    stamped
-        .into_iter()
-        .zip(1u64..)
-        .map(|((recv_ts, fill), global_seq)| SequencedFill {
-            global_seq,
-            recv_ts,
-            fill,
-        })
-        .collect()
-}
-
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E3779B97F4A7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
-
 /// recv_ts is a real epoch timestamp: wall-clock millis captured once at start
-/// advanced by the shared monotonic Instant. Ordering stays Instant-driven, 
+/// advanced by the shared monotonic Instant. Ordering stays Instant-driven,
 fn spawn_venue_stream(
-    mut lines: Vec<RawLine>,
+    lines: Vec<RawLine>,
     epoch_base_ms: u64,
     start: Instant,
     seed: u64,
 ) -> mpsc::Receiver<(u64, RawLine)> {
-    lines.sort_by_key(|line| line.parsed.as_ref().map(RawEvent::seq).unwrap_or(u64::MAX));
+    let lines = common::sorted_by_seq(lines); // producers deliver in venue_seq order
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut rng = seed;
         for line in lines {
-            thread::sleep(Duration::from_micros(splitmix64(&mut rng) % 150));
+            thread::sleep(Duration::from_micros(common::splitmix64(&mut rng) % 150));
             let recv_ts = epoch_base_ms + start.elapsed().as_millis() as u64;
             sender.send((recv_ts, line)).unwrap();
         }
@@ -95,41 +72,58 @@ fn realtime_recv_ts_stamping_upholds_algo_invariants() {
     // Stamps are epoch-anchored yet still monotonic per venue (no walk-back).
     for arrivals in [&hl_arrivals, &pm_arrivals] {
         assert!(arrivals.windows(2).all(|pair| pair[0].0 <= pair[1].0));
-        assert!(arrivals.iter().all(|(recv_ts, _)| *recv_ts >= epoch_base_ms));
+        assert!(arrivals
+            .iter()
+            .all(|(recv_ts, _)| *recv_ts >= epoch_base_ms));
     }
 
+    // Replay the merged arrival order through the pipeline: stamp → canonicalize → dedup →
+    // lane push, with incremental drains along the way.
     let mut ingester = Ingester::new(Registry::standard());
-    let mut recv_map: BTreeMap<(Venue, String), u64> = BTreeMap::new();
-    for (recv_ts, line) in hl_arrivals.into_iter().chain(pm_arrivals) {
-        if let Ok(event) = &line.parsed {
-            recv_map
-                .entry((line.venue, event.event_id().to_string()))
-                .or_insert(recv_ts);
+    let mut tape = Vec::new();
+    let mut last_stamp = 0u64;
+    let mut hl_iter = hl_arrivals.into_iter().peekable();
+    let mut pm_iter = pm_arrivals.into_iter().peekable();
+    loop {
+        let take_hl = match (hl_iter.peek(), pm_iter.peek()) {
+            (None, None) => break,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some((hl_ts, _)), Some((pm_ts, _))) => hl_ts <= pm_ts,
+        };
+        let (recv_ts, line) = if take_hl {
+            hl_iter.next()
+        } else {
+            pm_iter.next()
         }
-        ingester.ingest_line(line);
+        .unwrap();
+        ingester.fill_caught(recv_ts, line);
+        tape.extend(ingester.drain_ready());
+        last_stamp = last_stamp.max(recv_ts);
     }
 
-    let current = ingester.ordered_fills();
-    let stamped: Vec<(u64, Fill)> = current
-        .iter()
-        .map(|fill| (recv_map[&(fill.venue, fill.event_id.clone())], fill.clone()))
-        .collect();
-    let sequenced = sequence_fills(stamped.clone());
+    // I4 liveness: with both streams idle, ticks alone finish the tape — no flush needed.
+    ingester.tick(Venue::Hl, last_stamp + 1);
+    ingester.tick(Venue::Pm, last_stamp + 1);
+    tape.extend(ingester.drain_ready());
+    assert_eq!(ingester.sequencer().depth(), 0);
+    assert!(ingester.flush().is_empty());
 
-    assert_eq!(sequenced.len(), ingester.stats().accepted);
+    assert_eq!(tape.len(), ingester.stats().accepted);
+    assert_eq!(ingester.stats().out_of_order, 0);
 
     // I3: global_seq is exactly 1..=n and recv_ts never walks back.
-    assert!(sequenced
+    assert!(tape
         .iter()
         .zip(1u64..)
         .all(|(out, expected)| out.global_seq == expected));
-    assert!(sequenced
+    assert!(tape
         .windows(2)
         .all(|pair| pair[0].recv_ts <= pair[1].recv_ts));
 
     // I1: each venue's fills come out in venue_seq order.
     for venue in [Venue::Hl, Venue::Pm] {
-        let seqs: Vec<u64> = sequenced
+        let seqs: Vec<u64> = tape
             .iter()
             .filter(|out| out.fill.venue == venue)
             .map(|out| out.fill.seq)
@@ -138,71 +132,58 @@ fn realtime_recv_ts_stamping_upholds_algo_invariants() {
     }
 
     // I7: equal recv_ts collisions resolve by venue priority (Hl < Pm).
-    let cross_venue_ties = sequenced
+    let cross_venue_ties = tape
         .windows(2)
-        .filter(|pair| pair[0].recv_ts == pair[1].recv_ts && pair[0].fill.venue != pair[1].fill.venue)
+        .filter(|pair| {
+            pair[0].recv_ts == pair[1].recv_ts && pair[0].fill.venue != pair[1].fill.venue
+        })
         .inspect(|pair| {
             assert_eq!(pair[0].fill.venue, Venue::Hl);
             assert_eq!(pair[1].fill.venue, Venue::Pm);
         })
         .count();
 
-    // I2/I5: replaying the stamped set in any order reproduces the tape.
-    let mut replay = stamped;
-    let mut rng = 2024u64;
-    for i in (1..replay.len()).rev() {
-        let j = (splitmix64(&mut rng) % (i as u64 + 1)) as usize;
-        replay.swap(i, j);
+    // I2/I5: the tape is a pure function of the stamped fills — a bare sequencer fed the same
+    // stamps in a completely different push interleaving (venue-major) with a single flush
+    // reproduces it exactly, global_seq included.
+    let mut replay = Sequencer::new();
+    for wanted in [Venue::Hl, Venue::Pm] {
+        for out in tape.iter().filter(|out| out.fill.venue == wanted) {
+            replay
+                .push(out.fill.venue, out.recv_ts, out.fill.clone())
+                .unwrap();
+        }
     }
-    assert_eq!(sequence_fills(replay), sequenced);
+    assert_eq!(replay.flush(), tape);
 
-    // Today's ordered_fills() is venue-grouped: the whole HL block precedes PM.
-    assert_eq!(current[0].venue, Venue::Hl);
-    let first_pm = current
-        .iter()
-        .position(|fill| fill.venue == Venue::Pm)
-        .unwrap();
-    assert!(current[first_pm..].iter().all(|fill| fill.venue == Venue::Pm));
-
-    // Whenever the two streams overlapped in time (they practically always
-    // do), the algo order must interleave venues and diverge from the
-    // venue-grouped order.
-    let current_ids: Vec<&str> = current.iter().map(|fill| fill.event_id.as_str()).collect();
-    let new_ids: Vec<&str> = sequenced
-        .iter()
-        .map(|out| out.fill.event_id.as_str())
-        .collect();
-    let last_hl_stamp = sequenced
+    // Whenever the two streams overlapped in time (they practically always do), the tape must
+    // interleave venues rather than group them.
+    let last_hl_stamp = tape
         .iter()
         .filter(|out| out.fill.venue == Venue::Hl)
         .map(|out| out.recv_ts)
         .max()
         .unwrap();
-    let first_pm_stamp = sequenced
+    let first_pm_stamp = tape
         .iter()
         .filter(|out| out.fill.venue == Venue::Pm)
         .map(|out| out.recv_ts)
         .min()
         .unwrap();
-    if first_pm_stamp <= last_hl_stamp {
-        assert_ne!(current_ids, new_ids);
+    if first_pm_stamp < last_hl_stamp {
+        let first_pm_index = tape
+            .iter()
+            .position(|out| out.fill.venue == Venue::Pm)
+            .unwrap();
+        assert!(
+            tape[first_pm_index..]
+                .iter()
+                .any(|out| out.fill.venue == Venue::Hl),
+            "streams overlapped in time but the tape is venue-grouped"
+        );
     }
 
-    let current_entries = current
-        .iter()
-        .enumerate()
-        .map(|(position, fill)| {
-            serde_json::json!({
-                "position": position,
-                "recv_ts": recv_map[&(fill.venue, fill.event_id.clone())],
-                "exchange_ts_ms": fill.ts_ms,
-                "venue": format!("{:?}", fill.venue),
-                "event_id": fill.event_id,
-                "venue_seq": fill.seq,
-            })
-        })
-        .collect();
-    let algo_entries = sequenced
+    let algo_entries = tape
         .iter()
         .map(|out| {
             serde_json::json!({
@@ -217,25 +198,27 @@ fn realtime_recv_ts_stamping_upholds_algo_invariants() {
         .collect();
     println!(
         "wrote {}",
-        emit_json("ordering_current.json", current_entries).display()
-    );
-    println!(
-        "wrote {}",
         emit_json("ordering_algo.json", algo_entries).display()
     );
 
-    println!("pos | current (venue-grouped) | algo (recv_ts, venue, seq)");
-    for i in 0..10 {
-        println!("{:>3} | {:<23} | {}", i, current_ids[i], new_ids[i]);
+    println!("global_seq | recv_ts | venue | event_id");
+    for out in tape.iter().take(10) {
+        println!(
+            "{:>10} | {} | {:<5} | {}",
+            out.global_seq,
+            out.recv_ts,
+            format!("{:?}", out.fill.venue),
+            out.fill.event_id
+        );
     }
-    let distinct_stamps = sequenced
+    let distinct_stamps = tape
         .iter()
         .map(|out| out.recv_ts)
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     println!(
         "sequenced {} fills in {:?} | epoch base: {} | distinct recv_ts: {} | cross-venue ties broken by venue: {}",
-        sequenced.len(),
+        tape.len(),
         elapsed,
         epoch_base_ms,
         distinct_stamps,

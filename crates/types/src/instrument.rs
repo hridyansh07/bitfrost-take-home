@@ -28,12 +28,10 @@ pub struct InstrumentSpec {
 
 pub trait InstrumentSource {
     fn lookup(&self, venue: Venue, symbol: &str) -> Option<&InstrumentSpec>;
-    fn lookup_instrument(&self, instrument: &InstrumentId) -> Option<&InstrumentSpec>;
 }
 
 pub struct Registry {
     by_symbol: BTreeMap<(Venue, String), InstrumentSpec>,
-    by_instrument: BTreeMap<InstrumentId, InstrumentSpec>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -88,6 +86,8 @@ impl Registry {
             if by_symbol.contains_key(&key) {
                 return Err(RegistryError::DuplicateSymbol(spec.symbol));
             }
+            // Construction-time consistency check only: the same canonical instrument must
+            // carry identical economics wherever it appears.
             if let Some(existing) = by_instrument.get(&spec.instrument) {
                 if existing.kind != spec.kind
                     || existing.tick_micro != spec.tick_micro
@@ -101,10 +101,7 @@ impl Registry {
             }
             by_symbol.insert(key, spec);
         }
-        Ok(Registry {
-            by_symbol,
-            by_instrument,
-        })
+        Ok(Registry { by_symbol })
     }
 
     pub fn standard() -> Registry {
@@ -152,10 +149,6 @@ impl Registry {
 impl InstrumentSource for Registry {
     fn lookup(&self, venue: Venue, symbol: &str) -> Option<&InstrumentSpec> {
         self.by_symbol.get(&(venue, symbol.to_string()))
-    }
-
-    fn lookup_instrument(&self, instrument: &InstrumentId) -> Option<&InstrumentSpec> {
-        self.by_instrument.get(instrument)
     }
 }
 

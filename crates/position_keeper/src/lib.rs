@@ -4,18 +4,6 @@ use types::{
     PositionKey, RejectReason, Side, Ticks,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PositionRounding {
-    HalfEven,
-}
-
-pub const POSITION_ROUNDING: PositionRounding = PositionRounding::HalfEven;
-
-pub trait PositionStore {
-    fn apply(&mut self, fill: &Fill) -> Result<PositionDelta, RejectReason>;
-    fn position(&self, key: &PositionKey) -> Option<&Position>;
-}
-
 pub struct PositionKeeper<S> {
     instruments: S,
     positions: BTreeMap<PositionKey, Position>,
@@ -64,16 +52,6 @@ impl<S: InstrumentSource> PositionKeeper<S> {
 
     pub fn into_positions(self) -> BTreeMap<PositionKey, Position> {
         self.positions
-    }
-}
-
-impl<S: InstrumentSource> PositionStore for PositionKeeper<S> {
-    fn apply(&mut self, fill: &Fill) -> Result<PositionDelta, RejectReason> {
-        PositionKeeper::apply(self, fill)
-    }
-
-    fn position(&self, key: &PositionKey) -> Option<&Position> {
-        PositionKeeper::position(self, key)
     }
 }
 
@@ -542,7 +520,6 @@ mod tests {
 
         keeper.apply(&first).unwrap();
         let added = keeper.apply(&second).unwrap();
-        assert_eq!(POSITION_ROUNDING, PositionRounding::HalfEven);
         assert_eq!(added.after.open_cost, Micro(3));
         assert_eq!(added.after.avg_entry_price, Some(Ticks(2)));
 
